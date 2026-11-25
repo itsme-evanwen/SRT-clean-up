@@ -3,3 +3,6 @@ __pycache__/
 *.fixed.srt
 *.changes.txt
 .venv/
+output/
+.pytest_cache/
+dict.txt.big
