@@ -1,0 +1,5 @@
+__pycache__/
+*.pyc
+*.fixed.srt
+*.changes.txt
+.venv/
