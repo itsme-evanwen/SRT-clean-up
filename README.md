@@ -32,6 +32,24 @@ pip install -r requirements.txt
 curl -L -o dict.txt.big https://raw.githubusercontent.com/fxsjy/jieba/master/extra_dict/dict.txt.big
 ```
 
+## 圖形介面（GUI）
+
+```bash
+python srt_gui.py
+```
+
+或直接雙擊：Windows 用 `run_gui.bat`（也可以把 SRT 檔拖到圖示上），macOS 用 `run_gui.command`。
+
+1. **字幕檔**：選擇輸入 SRT，輸出檔預設為同資料夾的 `*.fixed.srt`。
+2. **詞典與取代表**：加入自訂詞典、取代表；「開啟編輯」用系統預設編輯器打開。
+   - 「找建議詞」產生 `*.terms.txt`，刪掉不是詞的行後加入詞典。
+   - 「找同音詞」產生 `*.homophones.txt`，把要統一的行刪掉「# 」後加入取代表。
+3. **處理選項**：斷句修正、合併、切分長字幕、修正時間軸，以及長度與門檻。
+4. 先按 **預覽修改** 看會改哪些地方（紅色為原文、綠色為修改後），沒問題再按 **執行並輸出**。
+
+設定（詞典、取代表、選項）會記在 `~/.srt_clean_up_gui.json`，下次開啟自動帶入。
+GUI 使用 Python 內建的 tkinter；Linux 若沒有，請安裝 `python3-tk`。
+
 ## 建議流程
 
 ```bash

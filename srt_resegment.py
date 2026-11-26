@@ -277,10 +277,9 @@ def find_main_dict(path: str | None) -> str | None:
 class Segmenter:
     def __init__(self, user_dicts=(), en_words: str | None = None,
                  main_dict: str | None = None, extra_words=()):
-        if main_dict:
-            jieba.set_dictionary(main_dict)
-        jieba.initialize()
-        self.dt = jieba.dt
+        # 每次建立獨立的分詞器，避免多次執行（如 GUI）時詞典互相累積
+        self.dt = jieba.Tokenizer(main_dict) if main_dict else jieba.Tokenizer()
+        self.dt.initialize()
         self.main_dict = main_dict
         for path in user_dicts or ():
             if not os.path.exists(path):
