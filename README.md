@@ -10,6 +10,8 @@
 | 時間軸檢查：列出過快、過短、重疊的字幕 | （一律檢查） | 開 |
 | 時間軸修正：自動修正上述問題 | `--fix-timing` | 關 |
 | 建議詞：找出詞典沒有的人名、術語 | `--suggest-terms 檔案` | 關 |
+| 同音詞檢查：找出同一個詞被辨識成不同同音字 | `--homophones 檔案` | 關 |
+| 內建台灣用詞詞典（臺大、衛福部、健保…） | `tw_dict.txt`，`--no-builtin-dict` 停用 | 開 |
 
 原本的換行、對話行（`- ` 開頭）與格式標籤（`<i>`、`{\an8}`）都會保留；沒被修改的字幕原樣輸出。
 
@@ -33,13 +35,15 @@ curl -L -o dict.txt.big https://raw.githubusercontent.com/fxsjy/jieba/master/ext
 ## 建議流程
 
 ```bash
-# 1. 先找出詞典沒有的詞，人工挑選
-python srt_resegment.py input.srt --dry-run --suggest-terms terms.txt
+# 1. 找出詞典沒有的詞、同音的不同寫法
+python srt_resegment.py input.srt --dry-run --suggest-terms terms.txt \
+    --homophones homophones.txt --homophones-fuzzy
 
-# 2. 編輯 terms.txt（刪掉不是詞的行）、建立 replace.txt（錯字對照）
+# 2. 編輯 terms.txt（刪掉不是詞的行）
+#    編輯 homophones.txt（要統一的行刪掉「# 」、箭頭右邊改成正確寫法）
 
 # 3. 正式處理，同時輸出修改清單
-python srt_resegment.py input.srt --dict terms.txt --replace replace.txt \
+python srt_resegment.py input.srt --dict terms.txt --replace homophones.txt \
     --split-chars 20 --fix-timing --report changes.txt
 ```
 
@@ -73,7 +77,9 @@ re:(?i)(?<![A-Za-z])pgt-?a(?![A-Za-z]) => PGT-A
 - 純英數的詞只比對完整單字（`AI` 不會換到 `AIR`）。
 - 正規式裡中文旁邊不要用 `\b`（Python 會把中文字當成單字的一部分），請用 `(?<![A-Za-z])`。
 - 取代後的正確詞會自動加入分詞詞典。
-- 取代在斷句修正之前進行；跨兩條字幕的錯字不會被取代。
+- 取代在斷句修正之前做一次；斷句修正後會再檢查字幕交界，被切成兩半的錯字
+  （「移」|「運生殖中心」）也會被取代，取代後的詞放到原本佔比較多的那一邊。
+- 每個出現的地方都會被取代，不看上下文；錯字本身也是正常詞時要小心誤換。
 
 範例：`examples/replace.txt`。
 
@@ -96,6 +102,31 @@ re:(?i)(?<![A-Za-z])pgt-?a(?![A-Za-z]) => PGT-A
 - 過快、過短：把連續有問題的字幕當成一組，延伸到前後的空白時間，再依字數比例以 `--target-cps`
   （預設每秒 6 字）重新分配。例如 AI 把 16 條字幕擠在 1.3 秒內，會被攤開到前面的空白時段。
   這是推估值，建議對照影片確認。
+
+### 同音詞檢查 `--homophones FILE`
+
+以「建議詞」為起點，在整份字幕中找讀音相同的其他寫法，寫成取代表草稿（每行預設註解掉）：
+
+```
+# xu pei yang：許佩陽 8、許培陽 4、徐培陽 2、續培養 1
+# 許培陽 => 許佩陽
+# 徐培陽 => 許佩陽
+# 續培養 => 許佩陽
+```
+
+確認後把要統一的行前面的 `# ` 刪掉（像「續培養」這種本來就是正確詞的就保留註解），
+右邊預設是出現最多次的寫法，若不是正確寫法請改掉，再用 `--replace` 帶入。
+
+- 預設只比對完全同音（不分聲調）。
+- `--homophones-fuzzy` 加上近音：zh/z、ch/c、sh/s、n/l、-ng/-n、送氣/不送氣（t/d、p/b、k/g、q/j、c/z），
+  可抓到「亞斯提 / 亞斯蒂」「張志婷 / 張子婷」，但雜訊也較多。
+- 需要 `pip install pypinyin`。
+
+### 詞典
+
+- `tw_dict.txt`：內建台灣用詞（學校醫院簡稱如臺大、榮總，機構如衛福部、國健署，健保、軟體等），自動載入。
+- `examples/dict_reproductive.txt`：生殖醫學詞典範例（試管嬰兒、囊胚、黃體素、拮抗劑…），用 `--dict` 載入。
+- 詞頻越高越不容易被切開；「臺/台」、繁簡寫一種即可。
 
 ### 建議詞 `--suggest-terms FILE`
 
@@ -132,6 +163,8 @@ re:(?i)(?<![A-Za-z])pgt-?a(?![A-Za-z]) => PGT-A
 | `--fix-timing` | | 修正時間軸 |
 | `--max-cps` / `--min-dur` / `--target-cps` | 15 / 0.5 / 6 | 時間軸門檻 |
 | `--suggest-terms` / `--suggest-min` | / 3 | 建議詞輸出檔、最少次數 |
+| `--homophones` / `--homophones-fuzzy` | | 同音詞輸出檔、包含近音 |
+| `--no-builtin-dict` | | 不載入 `tw_dict.txt` |
 
 ## 測試
 

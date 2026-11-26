@@ -1,2 +1,3 @@
 jieba>=0.42
 opencc-python-reimplemented>=0.1.7
+pypinyin>=0.50  # 同音詞檢查用（--homophones）

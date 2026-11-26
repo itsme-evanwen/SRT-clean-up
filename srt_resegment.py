@@ -8,7 +8,7 @@ SRT 字幕整理工具（繁體中文為主，可混英文）
   2. 斷句修正：兩條字幕交界切在詞中間（「台|北」）時接回並重新斷句
   3. 長字幕切分：超過長度的字幕在詞界切成兩條（--split-chars）
   4. 時間軸檢查：標出過快、過短、重疊的字幕；可自動重新分配（--fix-timing）
-  5. 詞典輔助：大詞典（台灣用詞）、自動找出建議加入詞典的專有名詞（--suggest-terms）
+  5. 詞典輔助：內建台灣用詞詞典、建議詞（--suggest-terms）、同音詞檢查（--homophones）
 
 保留原本的換行、對話行（- 開頭）與格式標籤（<i>、{\\an8}）。
 沒被修改的字幕會原樣輸出。
@@ -283,6 +283,9 @@ class Segmenter:
         self.dt = jieba.dt
         self.main_dict = main_dict
         for path in user_dicts or ():
+            if not os.path.exists(path):
+                print(f"警告：找不到詞典 {path}", file=sys.stderr)
+                continue
             with open(path, encoding="utf-8-sig") as f:
                 for line in f:
                     parts = line.strip().split()
@@ -469,6 +472,51 @@ def apply_replacements(cues: list[Cue], rules: list[Rule]) -> list[tuple]:
         if t != c.text:
             log.append((c.orig_index, c.text, t))
             c.text, c.modified = t, True
+    return log
+
+
+def apply_replacements_across(cues: list[Cue], rules: list[Rule], max_gap: float = 1.5) -> list[tuple]:
+    """
+    取代被切在兩條字幕之間的錯字（「移」|「運生殖中心」→「宜蘊」|「生殖中心」）。
+    取代後的詞整個放到原本佔比較多的那一邊，交界時間依字數比例調整。
+    """
+    log = []
+    for i in range(len(cues) - 1):
+        A, B = cues[i], cues[i + 1]
+        if A.locked or B.locked or not A.text or not B.text:
+            continue
+        if (B.start - A.end) / 1000.0 > max_gap:
+            continue
+        a, b0 = A.text.rstrip(), B.text.lstrip()
+        M = join_text(a, b0)
+        bpos = len(a)
+        for r in rules:
+            m = next((m for m in r.pattern.finditer(M) if m.start() < bpos < m.end()), None)
+            if not m:
+                continue
+            new = m.expand(r.repl)
+            if bpos - m.start() >= m.end() - bpos:      # 詞大部分在 A
+                na, nb = M[:m.start()] + new, M[m.end():].lstrip()
+                moved = M[bpos:m.end()].strip()
+                per = (B.end - B.start) / timing_len(b0)
+                t = int(B.start + timing_len(moved) * per) if nb else B.end
+                if nb:
+                    A.end = max(A.end, min(t, B.end - 1))
+                    B.start = A.end
+            else:                                          # 詞大部分在 B
+                na, nb = M[:m.start()].rstrip(), new + M[m.end():]
+                moved = M[m.start():bpos].strip()
+                per = (A.end - A.start) / timing_len(a)
+                if na:
+                    B.start = min(B.start, max(int(A.end - timing_len(moved) * per), A.start + 1))
+                    A.end = B.start
+            if not na or not nb:
+                continue      # 整條都會被搬空的少見情況，不處理
+            r.count += 1
+            log.append((A.orig_index + B.orig_index, f"{a}|{b0}", f"{na}|{nb}"))
+            A.text, B.text = na, nb
+            A.modified = B.modified = True
+            break
     return log
 
 
@@ -796,14 +844,8 @@ def fix_timing(cues: list[Cue], tp: TimingParams) -> list[tuple]:
 # --------------------------------------------------------------------------
 # E. 建議加入詞典的詞
 # --------------------------------------------------------------------------
-def suggest_terms(cues: list[Cue], seg: Segmenter, min_count: int = 3,
-                  max_len: int = 6, top: int = 200) -> list[tuple]:
-    """
-    從整份字幕找出「常出現、內部結合緊密、左右搭配多樣、但詞典沒有」的詞，
-    這些通常是人名、機構、藥名、術語，分詞時容易被切錯。
-    回傳 [(詞, 次數, 分數, 目前分詞結果)]。
-    """
-    # 把整份字幕的中文接成連續串（字幕交界也一起看，才抓得到被切開的詞）
+def ngram_stats(cues: list[Cue], max_len: int = 6):
+    """整份字幕中文 n-gram 的次數與左右鄰字（字幕交界也接起來看，才抓得到被切開的詞）。"""
     runs: list[str] = []
     buf = ""
     for c in cues:
@@ -827,6 +869,25 @@ def suggest_terms(cues: list[Cue], seg: Segmenter, min_count: int = 3,
                     left[w][r[i - 1] if i > 0 else "^"] += 1
                     right[w][r[i + n] if i + n < L else "$"] += 1
     total = sum(v for k, v in cnt.items() if len(k) == 1) or 1
+    return cnt, left, right, total
+
+
+def phrase_like(w: str, seg: "Segmenter") -> bool:
+    """w 是否像口語片語而非專有名詞（我想、把它、切片的時候、我們的）。"""
+    toks = seg.tokens(w)
+    if len(toks) > 1 and all(len(t) >= 2 for t in toks):
+        return True
+    return any(len(t) == 1 and t in STOP_CHARS for t in toks)
+
+
+def suggest_terms(cues: list[Cue], seg: Segmenter, min_count: int = 3,
+                  max_len: int = 6, top: int = 200) -> list[tuple]:
+    """
+    從整份字幕找出「常出現、內部結合緊密、左右搭配多樣、但詞典沒有」的詞，
+    這些通常是人名、機構、藥名、術語，分詞時容易被切錯。
+    回傳 [(詞, 次數, 分數, 目前分詞結果)]。
+    """
+    cnt, left, right, total = ngram_stats(cues, max_len)
 
     def entropy(c: Counter) -> float:
         s = sum(c.values())
@@ -845,13 +906,10 @@ def suggest_terms(cues: list[Cue], seg: Segmenter, min_count: int = 3,
         ent = min(entropy(left[w]), entropy(right[w]))
         if ent < 0.8:
             continue
+        # 可被切成多字詞的組合（我們的）、含虛詞的片語（把|它、切片|的|時候）略過
+        if phrase_like(w, seg):
+            continue
         toks = seg.tokens(w)
-        # 已經能被詞典切成「都是多字詞」的組合（如「我們的」）不需要加
-        if all(len(t) >= 2 for t in toks) and len(toks) > 1:
-            continue
-        # 含有獨立成詞的虛詞/常用字（把|它、很|高、切片|的|時候）→ 口語片語，略過
-        if any(len(t) == 1 and t in STOP_CHARS for t in toks):
-            continue
         score = k * math.log(coh) * ent
         cands.append((w, k, score, " | ".join(toks)))
     cands.sort(key=lambda x: -x[2])
@@ -869,6 +927,116 @@ def suggest_terms(cues: list[Cue], seg: Segmenter, min_count: int = 3,
 
 
 # --------------------------------------------------------------------------
+# 同音／近音詞檢查
+# --------------------------------------------------------------------------
+_py_cache: dict = {}
+
+
+def _fuzzy(py: str) -> str:
+    """常混的音：zh/z、ch/c、sh/s、n/l、-ng/-n，以及送氣/不送氣 t/d、p/b、k/g、q/j、c/z。"""
+    for a, b in (("zh", "z"), ("ch", "z"), ("sh", "s"), ("t", "d"), ("p", "b"), ("k", "g"),
+                 ("q", "j"), ("c", "z")):
+        if py.startswith(a):
+            py = b + py[len(a):]
+            break
+    if py.startswith("n") and not py.startswith("ng"):
+        py = "l" + py[1:]
+    if py.endswith("ng") and len(py) > 2:
+        py = py[:-1]
+    return py
+
+
+def char_reading(ch: str, fuzzy: bool = False) -> str:
+    """一個字最常用的讀音（不分聲調）。破音字只取常用讀音，避免「王/吳」這類誤配。"""
+    key = (ch, fuzzy)
+    r = _py_cache.get(key)
+    if r is None:
+        from pypinyin import lazy_pinyin
+        rs = lazy_pinyin(ch, errors=lambda x: [x])
+        r = rs[0] if rs else ch
+        if fuzzy:
+            r = _fuzzy(r)
+        _py_cache[key] = r
+    return r
+
+
+def sound_key(w: str, fuzzy: bool = False) -> tuple:
+    return tuple(char_reading(ch, fuzzy) for ch in w)
+
+
+def find_homophones(cues: list[Cue], seg: Segmenter, fuzzy: bool = False,
+                    min_count: int = 3) -> list[list[tuple[str, int]]]:
+    """
+    找出讀音相同（或相近）的不同寫法，例如「移運 / 宜孕 / 怡韻」「亞斯提 / 亞斯蒂」。
+    以「建議詞」（常出現、詞典沒有的詞）為起點，在整份字幕中找同音的其他寫法。
+    回傳每組 [(寫法, 次數), ...]，依次數排序。
+    """
+    try:
+        import pypinyin  # noqa: F401
+    except ImportError:
+        sys.exit("同音詞檢查需要 pypinyin：pip install pypinyin")
+    cnt, left, right, _ = ngram_stats(cues, 6)
+    seeds = [w for w, *_ in suggest_terms(cues, seg, min_count=min_count, top=400)]
+    lens = {len(t) for t in seeds}
+    index: dict = defaultdict(set)
+    for w in cnt:
+        if len(w) in lens:
+            index[sound_key(w, fuzzy)].add(w)
+
+    def fragment(v: str) -> bool:
+        """幾乎總是接同一個字 → 是更長詞的一部分（胚胎植 → 胚胎植入）。"""
+        k = cnt[v]
+        if k < 2:
+            return False
+        return any(c.most_common(1)[0][1] >= 0.9 * k and c.most_common(1)[0][0] not in "^$"
+                   for c in (left[v], right[v]))
+
+    def variant_ok(v: str) -> bool:
+        if phrase_like(v, seg) or fragment(v):
+            return False
+        f = seg.dt.FREQ.get(to_simplified(v)) or 0
+        return f < 50          # 本身就是常見正確詞（如「大動」）的不算
+
+    parent: dict = {}
+
+    def find(x):
+        while parent.setdefault(x, x) != x:
+            parent[x] = parent[parent[x]]
+            x = parent[x]
+        return x
+
+    for t in seeds:
+        for v in index.get(sound_key(t, fuzzy), ()):
+            if v != t and variant_ok(v):
+                parent[find(v)] = find(t)
+    groups: dict = defaultdict(list)
+    for w in list(parent):
+        groups[find(w)].append((w, cnt[w]))
+    out = []
+    for g in groups.values():
+        g.sort(key=lambda x: -x[1])
+        if len(g) >= 2 and sum(k for _, k in g) >= min_count:
+            out.append(g)
+    out.sort(key=lambda g: -sum(k for _, k in g))
+    return out
+
+
+def write_homophones(groups, path: str):
+    from pypinyin import lazy_pinyin
+    with open(path, "w", encoding="utf-8") as f:
+        f.write("# 同音／近音詞檢查（自動產生，請人工確認）\n"
+                "# 每組是讀音相同的不同寫法，可能是 AI 辨識成不同的同音字。\n"
+                "# 使用方式：把要統一的行前面的「# 」刪掉，箭頭右邊改成正確寫法，\n"
+                "#           存檔後用 --replace 這個檔案重跑。預設右邊是出現最多次的寫法。\n\n")
+        for g in groups:
+            head = g[0][0]
+            f.write(f"# {' '.join(lazy_pinyin(head))}：" + "、".join(f"{w} {k}" for w, k in g) + "\n")
+            for w, k in g[1:]:
+                f.write(f"# {w} => {head}\n")
+            f.write("\n")
+
+
+# --------------------------------------------------------------------------
 # CLI
 # --------------------------------------------------------------------------
 def main(argv=None):
@@ -881,6 +1049,9 @@ def main(argv=None):
     g = ap.add_argument_group("詞典")
     g.add_argument("--dict", action="append", default=[], help="自訂詞典（每行：詞 [詞頻]），可指定多個")
     g.add_argument("--main-dict", help="主詞典檔（如 jieba 的 dict.txt.big）；預設自動使用程式旁的 dict.txt.big，填 none 停用")
+    g.add_argument("--no-builtin-dict", action="store_true", help="不載入內建的台灣用詞詞典 tw_dict.txt")
+    g.add_argument("--homophones", metavar="FILE", help="找出讀音相同的不同寫法，寫成取代表草稿")
+    g.add_argument("--homophones-fuzzy", action="store_true", help="同音檢查也包含近音（zh/z、n/l、-ng/-n、t/d、p/b…）")
     g.add_argument("--en-words", help="英文單字表（每行一字），用於修正切斷的英文單字")
     g.add_argument("--suggest-terms", metavar="FILE", help="找出建議加入詞典的詞，寫到此檔")
     g.add_argument("--suggest-min", type=int, default=3, help="建議詞至少出現幾次（預設 3）")
@@ -911,7 +1082,9 @@ def main(argv=None):
     for path in a.replace:
         rules += load_replacements(path)
     main_dict = find_main_dict(a.main_dict)
-    seg = Segmenter(a.dict, a.en_words, main_dict, replacement_words(rules))
+    builtin = [] if a.no_builtin_dict else [x for x in (os.path.join(SCRIPT_DIR, "tw_dict.txt"),)
+                                            if os.path.exists(x)]
+    seg = Segmenter(builtin + a.dict, a.en_words, main_dict, replacement_words(rules))
 
     content, enc = read_text(a.input, a.encoding)
     cues = parse_srt(content)
@@ -944,6 +1117,13 @@ def main(argv=None):
         out_lines.append(f"[{ch.reason}] {ids}\n    原：「" + "」|「".join(ch.before)
                          + "」\n    新：「" + "」|「".join(ch.after) + "」")
 
+    # 跨字幕的錯字（斷句修正後再檢查一次交界）
+    cross_log = apply_replacements_across(cues, rules, p.max_gap) if rules else []
+    if cross_log:
+        out_lines.append(f"\n=== 跨字幕取代（{len(cross_log)} 處）===")
+        for idx, b, af in cross_log:
+            out_lines.append(f"  #{','.join(map(str, idx))}  「{b}」→「{af}」")
+
     # C. 長字幕切分
     cues, splits = rs.split_long(cues)
     if p.split_chars > 0:
@@ -969,6 +1149,14 @@ def main(argv=None):
         remain = check_timing(cues, tp)
         out_lines.append(f"  修正後仍有 {len(remain)} 筆警告")
 
+    # 同音詞
+    if a.homophones:
+        groups = find_homophones(cues, seg, a.homophones_fuzzy, a.suggest_min)
+        write_homophones(groups, a.homophones)
+        out_lines.append(f"\n=== 同音詞：{len(groups)} 組，已寫入 {a.homophones} ===")
+        for g in groups[:20]:
+            out_lines.append("  " + " / ".join(f"{w}({k})" for w, k in g))
+
     # E. 建議詞
     if a.suggest_terms:
         terms = suggest_terms(cues, seg, a.suggest_min)
@@ -981,7 +1169,7 @@ def main(argv=None):
         out_lines.append(f"\n=== 建議詞：{len(terms)} 個，已寫入 {a.suggest_terms} ===")
         out_lines.append("  " + "、".join(w for w, *_ in terms[:30]))
 
-    out_lines.append(f"\n共 {n_in} 條字幕；取代 {len(rep_log)} 條、斷句修正 {len(changes)} 處、"
+    out_lines.append(f"\n共 {n_in} 條字幕；取代 {len(rep_log) + len(cross_log)} 條、斷句修正 {len(changes)} 處、"
                      f"切分 {len(splits)} 處；輸出 {len(cues)} 條。")
     report = "\n".join(out_lines)
     print(report)

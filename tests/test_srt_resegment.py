@@ -105,3 +105,35 @@ def test_suggest_terms_finds_names():
     cues = S.parse_srt(srt(*[(i, i + 1, t) for i, t in enumerate(lines)]))
     terms = [w for w, *_ in S.suggest_terms(cues, SEG, min_count=3)]
     assert "亞斯提" in terms
+
+
+def test_replace_across_boundary(tmp_path):
+    f = tmp_path / "r.txt"
+    f.write_text("移運 => 宜蘊\n", encoding="utf-8")
+    rules = S.load_replacements(str(f))
+    cues = S.parse_srt(srt((1, 3, "我是臺北移"), (3, 6, "運生殖中心的醫師")))
+    assert S.apply_replacements(cues, rules) == []          # 單條字幕內找不到
+    log = S.apply_replacements_across(cues, rules)
+    assert len(log) == 1
+    assert texts(cues) == ["我是臺北宜蘊", "生殖中心的醫師"]
+    assert cues[0].end == cues[1].start and 3000 <= cues[0].end < 6000
+
+
+def test_builtin_dict_taida():
+    seg = S.Segmenter([os.path.join(os.path.dirname(__file__), "..", "tw_dict.txt")])
+    rs = S.Resegmenter(seg, S.Params())
+    a = S.make_cue(0, 2000, ["我們結合我們臺"])
+    b = S.make_cue(2000, 4000, ["大生物科技研究所胚胎學"])
+    na, nb = rs.fix_pair(a, b)
+    assert "臺大" in nb or "臺大" in na
+
+
+def test_homophones():
+    filler = ["這是一段很普通的開場白", "大家好歡迎來到今天的研討會", "我們先看一下這張圖表",
+              "接下來討論臨床上的結果", "謝謝各位的耐心聆聽", "那今天的天氣非常好"] * 6
+    lines = filler + ["今天請到許佩陽的專家", "所以許佩陽在實驗中", "我們跟許佩陽做研究",
+                      "那個許佩陽很有經驗", "如果問許培陽就知道", "醫師說許培陽比較強"]
+    cues = S.parse_srt(srt(*[(i, i + 1, t) for i, t in enumerate(lines)]))
+    groups = S.find_homophones(cues, SEG, min_count=3)
+    flat = [{w for w, _ in g} for g in groups]
+    assert any({"許佩陽", "許培陽"} <= g for g in flat)
