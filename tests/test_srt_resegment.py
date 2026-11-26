@@ -137,3 +137,80 @@ def test_homophones():
     groups = S.find_homophones(cues, SEG, min_count=3)
     flat = [{w for w, _ in g} for g in groups]
     assert any({"許佩陽", "許培陽"} <= g for g in flat)
+
+
+# ---- 回歸測試：程式碼檢查時找到的問題 ----
+def test_parse_without_blank_lines():
+    cues = S.parse_srt("1\n00:00:01,000 --> 00:00:02,000\n第一句\n2\n00:00:02,000 --> 00:00:03,000\n第二句\n")
+    assert texts(cues) == ["第一句", "第二句"]
+
+
+def test_parse_numeric_text_kept():
+    cues = S.parse_srt("1\n00:00:01,000 --> 00:00:02,000\n2024\n\n2\n00:00:02,000 --> 00:00:03,000\n好\n")
+    assert texts(cues) == ["2024", "好"]
+
+
+def test_empty_cue_dropped(tmp_path):
+    f = tmp_path / "r.txt"
+    f.write_text("嗯 => \n", encoding="utf-8")
+    cues = S.parse_srt(srt((1, 2, "嗯"), (2, 3, "好")))
+    S.apply_replacements(cues, S.load_replacements(str(f)))
+    out = S.write_srt(cues, 0, SEG)
+    assert out.startswith("1\n00:00:02,000") and len(S.parse_srt(out)) == 1
+
+
+def test_no_move_between_different_tags():
+    cues, ch, _ = run(srt((1, 3, "<i>我們明天要去台</i>"), (3, 5, "北看展覽")))
+    assert ch == []
+
+
+def test_out_of_order_times_untouched():
+    rs = S.Resegmenter(SEG, S.Params())
+    a = S.make_cue(5000, 6000, ["好那我們今天要來介紹的"])
+    b = S.make_cue(3000, 7000, ["了所以"])
+    assert rs.fix_pair(a, b) is None
+
+
+def test_replacement_keeps_line_breaks_and_tags(tmp_path):
+    f = tmp_path / "r.txt"
+    f.write_text("mosaism => mosaicism\ni => X\n", encoding="utf-8")
+    rules = S.load_replacements(str(f))
+    cues = S.parse_srt(srt((1, 3, "第一行 mosaism\n第二行"), (3, 5, "前面<i>mosaism</i>後面")))
+    S.apply_replacements(cues, rules)
+    out = S.write_srt(cues, 0, SEG)
+    assert "第一行 mosaicism\n第二行" in out
+    assert "前面<i>mosaicism</i>後面" in out          # <i> 標籤沒被「i => X」換掉
+    assert cues[1].text == "前面<i>mosaicism</i>後面"
+
+
+def test_replacement_across_line_break(tmp_path):
+    f = tmp_path / "r.txt"
+    f.write_text("移運 => 宜蘊\n", encoding="utf-8")
+    cues = S.parse_srt(srt((1, 3, "臺北移\n運生殖中心")))
+    S.apply_replacements(cues, S.load_replacements(str(f)))
+    assert cues[0].text == "臺北宜蘊生殖中心"
+
+
+def test_utf16_without_bom(tmp_path):
+    f = tmp_path / "u.srt"
+    f.write_bytes("1\n00:00:01,000 --> 00:00:03,000\n測試\n".encode("utf-16-le"))
+    text, enc = S.read_text(str(f), None)
+    assert enc == "utf-16-le" and texts(S.parse_srt(text)) == ["測試"]
+
+
+def test_cli_refuses_overwriting_input(tmp_path):
+    f = tmp_path / "a.srt"
+    content = srt((1, 3, "我們明天要去台"), (3, 5, "北看展覽"))
+    f.write_text(content, encoding="utf-8")
+    import pytest
+    with pytest.raises(SystemExit):
+        S.main([str(f), "-o", str(f)])
+    assert f.read_text(encoding="utf-8") == content
+
+
+def test_bom_preserved(tmp_path):
+    f = tmp_path / "a.srt"
+    f.write_bytes(b"\xef\xbb\xbf" + srt((1, 3, "我們明天要去台"), (3, 5, "北看展覽")).encode())
+    out = tmp_path / "b.srt"
+    S.main([str(f), "-o", str(out)])
+    assert out.read_bytes().startswith(b"\xef\xbb\xbf")

@@ -51,7 +51,7 @@ SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 # --------------------------------------------------------------------------
 # 字元分類
 # --------------------------------------------------------------------------
-CJK_RE = re.compile(r"[㐀-䶿一-鿿豈-﫿\U00020000-\U0002ffff]")
+CJK_RE = re.compile(r"[\u3400-\u4dbf\u4e00-\u9fff\uf900-\ufaff\U00020000-\U0002ffff]")
 ASCII_WORD_RE = re.compile(r"[A-Za-z0-9][A-Za-z0-9'’\-\.%]*")
 # 句末/句中標點：斷在它「後面」很好
 BREAK_AFTER = set("，。！？；：、,.!?;:…～~」』）)】》\"”’")
@@ -200,6 +200,14 @@ def read_text(path: str, encoding: str | None) -> tuple[str, str]:
         return raw.decode(encoding, errors="replace"), encoding
     if raw.startswith((b"\xff\xfe", b"\xfe\xff")):
         return raw.decode("utf-16"), "utf-16"
+    if raw[:2000].count(b"\x00") > len(raw[:2000]) // 4:   # UTF-16 但沒有 BOM
+        for enc in ("utf-16-le", "utf-16-be"):
+            try:
+                t = raw.decode(enc)
+                if "-->" in t:
+                    return t, enc
+            except UnicodeDecodeError:
+                pass
     for enc in ("utf-8-sig", "cp950", "big5hkscs", "gb18030"):
         try:
             return raw.decode(enc), enc
@@ -210,19 +218,23 @@ def read_text(path: str, encoding: str | None) -> tuple[str, str]:
 
 
 def parse_srt(content: str) -> list[Cue]:
-    content = content.lstrip("﻿").replace("\r\n", "\n").replace("\r", "\n")
+    """
+    以「時間軸行」切分字幕，不依賴空行；缺少空行的 SRT 也能正確讀取。
+    緊接在下一條時間軸行前面的純數字行視為序號。
+    """
+    content = content.lstrip("\ufeff").replace("\r\n", "\n").replace("\r", "\n")
+    lines = content.split("\n")
+    starts = [i for i, l in enumerate(lines) if "-->" in l and TIME_RE.search(l)]
     cues: list[Cue] = []
-    for block in re.split(r"\n\s*\n", content.strip()):
-        lines = block.split("\n")
-        ti = next((i for i, l in enumerate(lines) if "-->" in l), None)
-        if ti is None:
-            continue
-        m = TIME_RE.search(lines[ti])
-        if not m:
-            continue
-        g = m.groups()
-        cues.append(make_cue(_ms(*g[0:4]), _ms(*g[4:8]), lines[ti + 1:], g[8].rstrip(),
-                             [len(cues) + 1]))
+    for k, ti in enumerate(starts):
+        end = starts[k + 1] if k + 1 < len(starts) else len(lines)
+        body = lines[ti + 1:end]
+        if k + 1 < len(starts) and body and body[-1].strip().isdigit():
+            body = body[:-1]                   # 下一條的序號
+        while body and not body[-1].strip():
+            body.pop()
+        g = TIME_RE.search(lines[ti]).groups()
+        cues.append(make_cue(_ms(*g[0:4]), _ms(*g[4:8]), body, g[8].rstrip(), [len(cues) + 1]))
     return cues
 
 
@@ -256,11 +268,18 @@ def wrap_line(text: str, max_line: float, seg: "Segmenter") -> str:
 
 
 def write_srt(cues: list[Cue], max_line: float, seg: "Segmenter") -> str:
+    """輸出 SRT；內容為空的字幕（例如取代後只剩空白）會略過。"""
     out = []
-    for i, c in enumerate(cues, 1):
-        out.append(f"{i}\n{fmt_time(c.start)} --> {fmt_time(c.end)}{c.extra}\n"
-                   f"{render_text(c, max_line, seg)}\n")
+    for c in cues:
+        text = render_text(c, max_line, seg)
+        if not TAG_RE.sub("", text).strip():
+            continue
+        out.append(f"{len(out) + 1}\n{fmt_time(c.start)} --> {fmt_time(c.end)}{c.extra}\n{text}\n")
     return "\n".join(out)
+
+
+def count_empty(cues: list[Cue], max_line: float, seg: "Segmenter") -> int:
+    return sum(1 for c in cues if not TAG_RE.sub("", render_text(c, max_line, seg)).strip())
 
 
 # --------------------------------------------------------------------------
@@ -450,27 +469,44 @@ def replacement_words(rules: list[Rule]) -> list[str]:
     return [r.repl.replace("\\\\", "\\") for r in rules if not r.src.startswith("re:")]
 
 
+def can_join(A: Cue, B: Cue) -> bool:
+    """兩條字幕可以互相搬移文字：格式標籤相同，且時間順序正常。"""
+    return (A.prefix, A.suffix) == (B.prefix, B.suffix) and \
+        A.start <= A.end and B.start <= B.end and A.start <= B.start
+
+
 def apply_replacements(cues: list[Cue], rules: list[Rule]) -> list[tuple]:
+    """
+    先在原始文字行上逐行取代（保留換行與標籤，字幕維持原排版），
+    再檢查跨行的錯字（「移」換行「運」），有的話改在合併後的內文上取代。
+    """
     log = []
-    for c in cues:
-        if c.locked:
-            new_lines = []
-            for l in c.lines:
-                for r in rules:
-                    l, n = r.pattern.subn(r.repl, l)
+    for i, c in enumerate(cues):
+        before = c.text
+        new_lines = []
+        for l in c.lines:
+            parts = re.split(f"({TAG_RE.pattern})", l)      # 標籤本身不取代
+            for r in rules:
+                for j in range(0, len(parts), 2):
+                    parts[j], n = r.pattern.subn(r.repl, parts[j])
                     r.count += n
-                new_lines.append(l)
-            if new_lines != c.lines:
-                log.append((c.orig_index, "\n".join(c.lines), "\n".join(new_lines)))
-                c.lines = new_lines
-            continue
-        t = c.text
-        for r in rules:
-            t, n = r.pattern.subn(r.repl, t)
-            r.count += n
-        if t != c.text:
-            log.append((c.orig_index, c.text, t))
-            c.text, c.modified = t, True
+            new_lines.append("".join(parts))
+        nc = c
+        if new_lines != c.lines:
+            nc = make_cue(c.start, c.end, new_lines, c.extra, c.orig_index)
+            nc.modified = c.modified
+            if c.modified:            # 之前已被改過的字幕，內文以處理過的為準再取代
+                nc.text = c.text
+        if not nc.locked:
+            t = nc.text
+            for r in rules:
+                t, n = r.pattern.subn(r.repl, t)
+                r.count += n
+            if t != nc.text:
+                nc.text, nc.modified = t, True
+        if nc is not c or nc.text != before:
+            log.append((c.orig_index, before, nc.text))
+            cues[i] = nc
     return log
 
 
@@ -482,7 +518,7 @@ def apply_replacements_across(cues: list[Cue], rules: list[Rule], max_gap: float
     log = []
     for i in range(len(cues) - 1):
         A, B = cues[i], cues[i + 1]
-        if A.locked or B.locked or not A.text or not B.text:
+        if A.locked or B.locked or not A.text or not B.text or not can_join(A, B):
             continue
         if (B.start - A.end) / 1000.0 > max_gap:
             continue
@@ -601,7 +637,7 @@ class Resegmenter:
     def fix_pair(self, A: Cue, B: Cue) -> tuple[str, str] | str | None:
         """回傳 (新A文字, 新B文字)、'MERGE'，或 None（不需修改）。"""
         p = self.p
-        if A.locked or B.locked:
+        if A.locked or B.locked or not can_join(A, B):
             return None
         gap = (B.start - A.end) / 1000.0
         if gap > p.max_gap or not A.text or not B.text:
@@ -686,6 +722,8 @@ class Resegmenter:
             t = max(t, A.start + min(300, (A.end - A.start) // 2))
             B.start = min(B.start, int(t))
             A.end = B.start
+        A.end = max(A.end, A.start)            # 保險：不產生負的時長
+        B.start = min(max(B.start, A.end), B.end)
 
     # ---- C. 長字幕切分 ----
     def best_split(self, text: str) -> int | None:
@@ -1085,7 +1123,13 @@ def main(argv=None):
                                             if os.path.exists(x)]
     seg = Segmenter(builtin + a.dict, a.en_words, main_dict, replacement_words(rules))
 
+    out_path = None if a.dry_run else (
+        a.output or re.sub(r"(\.srt)?$", ".fixed.srt", a.input, count=1, flags=re.I))
+    if out_path and os.path.exists(out_path) and os.path.samefile(out_path, a.input):
+        sys.exit("錯誤：輸出檔不能和輸入檔相同（會覆蓋原始字幕），請用 -o 指定其他檔名")
     content, enc = read_text(a.input, a.encoding)
+    with open(a.input, "rb") as f:
+        had_bom = f.read(3) == b"\xef\xbb\xbf"
     cues = parse_srt(content)
     n_in = len(cues)
     out_lines: list[str] = [f"輸入：{a.input}（{enc}，{n_in} 條）"
@@ -1168,8 +1212,11 @@ def main(argv=None):
         out_lines.append(f"\n=== 建議詞：{len(terms)} 個，已寫入 {a.suggest_terms} ===")
         out_lines.append("  " + "、".join(w for w, *_ in terms[:30]))
 
+    n_empty = count_empty(cues, a.max_line, seg)
+    if n_empty:
+        out_lines.append(f"\n輸出時略過 {n_empty} 條空白字幕（取代後沒有文字）。")
     out_lines.append(f"\n共 {n_in} 條字幕；取代 {len(rep_log) + len(cross_log)} 條、斷句修正 {len(changes)} 處、"
-                     f"切分 {len(splits)} 處；輸出 {len(cues)} 條。")
+                     f"切分 {len(splits)} 處；輸出 {len(cues) - n_empty} 條。")
     report = "\n".join(out_lines)
     print(report)
 
@@ -1177,8 +1224,8 @@ def main(argv=None):
         with open(a.report, "w", encoding="utf-8") as f:
             f.write(report + "\n")
     if not a.dry_run:
-        out = a.output or re.sub(r"(\.srt)?$", ".fixed.srt", a.input, count=1, flags=re.I)
-        with open(out, "w", encoding="utf-8") as f:
+        out = out_path
+        with open(out, "w", encoding="utf-8-sig" if had_bom else "utf-8") as f:
             f.write(write_srt(cues, a.max_line, seg))
         print(f"已輸出：{out}")
 

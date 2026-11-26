@@ -11,6 +11,7 @@ from __future__ import annotations
 import io
 import json
 import os
+import queue
 import subprocess
 import sys
 import threading
@@ -27,6 +28,16 @@ sys.path.insert(0, HERE)
 SETTINGS_FILE = os.path.join(os.path.expanduser("~"), ".srt_clean_up_gui.json")
 SRT_TYPES = [("SRT 字幕", "*.srt"), ("所有檔案", "*.*")]
 TXT_TYPES = [("文字檔", "*.txt"), ("所有檔案", "*.*")]
+
+
+def same_file(a: str, b: str) -> bool:
+    """是否為同一個檔案（Windows 不分大小寫、捷徑/符號連結也算）。"""
+    try:
+        if os.path.exists(a) and os.path.exists(b):
+            return os.path.samefile(a, b)
+    except OSError:
+        pass
+    return os.path.normcase(os.path.abspath(a)) == os.path.normcase(os.path.abspath(b))
 
 
 def open_path(path: str):
@@ -91,6 +102,7 @@ class App(tk.Tk):
         self.geometry("880x760")
         self.minsize(760, 640)
         self.busy = False
+        self.results: queue.Queue = queue.Queue()   # 背景執行緒 → 主執行緒
         self._build()
         self._load_settings()
         self.protocol("WM_DELETE_WINDOW", self._on_close)
@@ -260,9 +272,10 @@ class App(tk.Tk):
             args.append("--dry-run")
         else:
             out = self.v_out.get().strip()
-            if not out:
-                raise ValueError("請指定輸出檔")
-            if os.path.abspath(out) == os.path.abspath(src):
+            if not out:                       # 手動輸入路徑時沒有自動帶出輸出檔名
+                out = os.path.splitext(src)[0] + ".fixed.srt"
+                self.v_out.set(out)
+            if same_file(out, src):
                 raise ValueError("輸出檔不能和輸入檔相同，以免覆蓋原始字幕")
             args += ["-o", out]
         return args
@@ -287,12 +300,24 @@ class App(tk.Tk):
                     S.main(args)
             except SystemExit as e:
                 ok = e.code in (None, 0)
+                if isinstance(e.code, str):
+                    buf.write("\n" + e.code + "\n")
             except Exception:
                 ok = False
                 buf.write("\n發生錯誤：\n" + traceback.format_exc())
-            self.after(0, lambda: self._finish(buf.getvalue(), ok, label, on_done))
+            # tkinter 不是執行緒安全的：結果放進佇列，由主執行緒輪詢取出
+            self.results.put((buf.getvalue(), ok, label, on_done))
 
         threading.Thread(target=work, daemon=True).start()
+        self.after(150, self._poll)
+
+    def _poll(self):
+        try:
+            text, ok, label, on_done = self.results.get_nowait()
+        except queue.Empty:
+            self.after(150, self._poll)
+            return
+        self._finish(text, ok, label, on_done)
 
     def _finish(self, text: str, ok: bool, label: str, on_done):
         self.busy = False
@@ -332,7 +357,7 @@ class App(tk.Tk):
         except ValueError as e:
             messagebox.showwarning("無法執行", str(e))
             return
-        if not dry and os.path.exists(self.v_out.get()):
+        if not dry and os.path.exists(self.v_out.get().strip()):
             if not messagebox.askyesno("覆蓋檔案", f"輸出檔已存在，要覆蓋嗎？\n{self.v_out.get()}"):
                 return
         self._save_settings()
@@ -425,6 +450,8 @@ class App(tk.Tk):
                 var.set(str(s[key]))
 
     def _on_close(self):
+        if self.busy and not messagebox.askyesno("處理中", "仍在處理中，確定要關閉嗎？"):
+            return
         self._save_settings()
         self.destroy()
 
