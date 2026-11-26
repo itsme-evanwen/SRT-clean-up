@@ -105,6 +105,7 @@ def vis_len(text: str) -> float:
 def timing_len(text: str) -> float:
     """估計念出這段文字所需的「字數」（中文一字一音節，英文約 3 字母一音節）。"""
     n = 0.0
+    text = TAG_RE.sub("", text)
     for tok in re.findall(r"[A-Za-z]+|\d|\S", text):
         if tok[0].isalpha() and tok.isascii():
             n += max(1.0, len(tok) / 3.0)
@@ -464,6 +465,47 @@ def load_replacements(path: str) -> list[Rule]:
     return rules
 
 
+def apply_rules(text: str, rules: list[Rule], spans: list[int] | None = None) -> str:
+    """
+    一次套用所有取代規則（同時取代，不連鎖）：從左到右找最早出現的匹配，
+    同位置取最長、再取規則順序在前者；取代後的文字不會再被其他規則處理。
+    spans 有值時，只取代跨過這些位置的匹配（用於跨行/跨字幕的錯字）。
+    """
+    if not rules or not text:
+        return text
+    out, pos = [], 0
+    while pos <= len(text):
+        best = None
+        for k, r in enumerate(rules):
+            m = r.pattern.search(text, pos)
+            while m and spans is not None and not any(m.start() < b < m.end() for b in spans):
+                m = r.pattern.search(text, m.start() + 1)
+            if m and m.end() > m.start():
+                key = (m.start(), -(m.end() - m.start()), k)
+                if best is None or key < best[0]:
+                    best = (key, m, r)
+        if best is None:
+            break
+        _, m, r = best
+        out.append(text[pos:m.start()])
+        out.append(m.expand(r.repl))
+        r.count += 1
+        pos = m.end()
+    out.append(text[pos:])
+    return "".join(out)
+
+
+def line_join_points(lines: list[str]) -> tuple[str, list[int]]:
+    """把多行接成內文（同 make_cue 的接法），並回傳每個換行處在內文中的位置。"""
+    text, points = "", []
+    for l in lines:
+        l = l.strip()
+        if text and l:
+            points.append(len(text.rstrip()))
+        text = join_text(text, l)
+    return text, points
+
+
 def replacement_words(rules: list[Rule]) -> list[str]:
     """取代後的正確詞（非正規式）一併加入分詞詞典。"""
     return [r.repl.replace("\\\\", "\\") for r in rules if not r.src.startswith("re:")]
@@ -483,27 +525,30 @@ def apply_replacements(cues: list[Cue], rules: list[Rule]) -> list[tuple]:
     log = []
     for i, c in enumerate(cues):
         before = c.text
+        if c.modified and not c.locked:
+            # 內文已被其他步驟改過、與原始行不同 → 直接在內文上取代
+            t = apply_rules(c.text, rules)
+            if t != c.text:
+                log.append((c.orig_index, before, t))
+                c.text = t
+            continue
         new_lines = []
         for l in c.lines:
             parts = re.split(f"({TAG_RE.pattern})", l)      # 標籤本身不取代
-            for r in rules:
-                for j in range(0, len(parts), 2):
-                    parts[j], n = r.pattern.subn(r.repl, parts[j])
-                    r.count += n
+            for j in range(0, len(parts), 2):
+                parts[j] = apply_rules(parts[j], rules)
             new_lines.append("".join(parts))
         nc = c
         if new_lines != c.lines:
             nc = make_cue(c.start, c.end, new_lines, c.extra, c.orig_index)
-            nc.modified = c.modified
-            if c.modified:            # 之前已被改過的字幕，內文以處理過的為準再取代
-                nc.text = c.text
-        if not nc.locked:
-            t = nc.text
-            for r in rules:
-                t, n = r.pattern.subn(r.repl, t)
-                r.count += n
-            if t != nc.text:
-                nc.text, nc.modified = t, True
+        if not nc.locked and len(nc.lines) > 1 and not TAG_RE.search(nc.text):
+            # 被換行切開的錯字（「移」換行「運」）：只取代跨過換行處的匹配
+            body = [TAG_RE.sub("", l) for l in nc.lines]
+            _, points = line_join_points(body)
+            if points:
+                t = apply_rules(nc.text, rules, spans=points)
+                if t != nc.text:
+                    nc.text, nc.modified = t, True
         if nc is not c or nc.text != before:
             log.append((c.orig_index, before, nc.text))
             cues[i] = nc
@@ -525,10 +570,14 @@ def apply_replacements_across(cues: list[Cue], rules: list[Rule], max_gap: float
         a, b0 = A.text.rstrip(), B.text.lstrip()
         M = join_text(a, b0)
         bpos = len(a)
-        for r in rules:
-            m = next((m for m in r.pattern.finditer(M) if m.start() < bpos < m.end()), None)
-            if not m:
-                continue
+        cands = []
+        for k, r in enumerate(rules):
+            m = r.pattern.search(M)
+            while m and not (m.start() < bpos < m.end()):
+                m = r.pattern.search(M, m.start() + 1)
+            if m:
+                cands.append(((m.start(), -(m.end() - m.start()), k), m, r))
+        for _, m, r in sorted(cands, key=lambda x: x[0])[:1]:
             new = m.expand(r.repl)
             if bpos - m.start() >= m.end() - bpos:      # 詞大部分在 A
                 na, nb = M[:m.start()] + new, M[m.end():].lstrip()
@@ -799,6 +848,7 @@ class TimingParams:
     min_dur: float = 0.5       # 短於幾秒視為過短
     target_cps: float = 6.0    # 自動修正時的目標語速（每秒字數）
     min_gap: int = 0           # 修正時字幕之間保留的間隔（ms）
+    max_dur: float = 7.0       # 長於幾秒視為過長（只警告）
 
 
 def cps(c: Cue) -> float:
@@ -806,21 +856,29 @@ def cps(c: Cue) -> float:
     return timing_len(c.text) / d if d > 0 else float("inf")
 
 
+def idx_str(c: Cue) -> str:
+    """原始字幕序號（合併的顯示 3,4；切分出來的兩段序號相同）。"""
+    return ",".join(map(str, c.orig_index)) or "?"
+
+
 def check_timing(cues: list[Cue], tp: TimingParams) -> list[tuple]:
-    """回傳 (輸出序號, 時間, 類型, 說明, 文字)。"""
+    """回傳 (原始序號, 時間, 類型, 說明, 文字)。"""
     warns = []
     for i, c in enumerate(cues):
         d = (c.end - c.start) / 1000.0
+        k = idx_str(c)
         if d <= 0:
-            warns.append((i + 1, c.start, "時長≤0", f"{d:.3f}s", c.text))
+            warns.append((k, c.start, "時長≤0", f"{d:.3f}s", c.text))
             continue
         if i + 1 < len(cues) and cues[i + 1].start < c.end:
-            warns.append((i + 1, c.start, "重疊", f"與下一條重疊 {(c.end - cues[i+1].start)/1000:.3f}s", c.text))
+            warns.append((k, c.start, "重疊", f"與下一條重疊 {(c.end - cues[i+1].start)/1000:.3f}s", c.text))
         r = cps(c)
         if r > tp.max_cps:
-            warns.append((i + 1, c.start, "過快", f"{r:.1f} 字/秒（{d:.2f}s）", c.text))
+            warns.append((k, c.start, "過快", f"{r:.1f} 字/秒（{d:.2f}s）", c.text))
         elif d < tp.min_dur:
-            warns.append((i + 1, c.start, "過短", f"{d:.2f}s", c.text))
+            warns.append((k, c.start, "過短", f"{d:.2f}s", c.text))
+        elif tp.max_dur > 0 and d > tp.max_dur:
+            warns.append((k, c.start, "過長", f"{d:.1f}s", c.text))
     return warns
 
 
@@ -836,7 +894,7 @@ def fix_timing(cues: list[Cue], tp: TimingParams) -> list[tuple]:
     for i in range(n - 1):
         a, b = cues[i], cues[i + 1]
         if b.start < a.end and a.start < b.start:
-            log.append((i + 1, "重疊", f"{fmt_time(a.end)} → {fmt_time(b.start)}"))
+            log.append((idx_str(a), "重疊", f"{fmt_time(a.end)} → {fmt_time(b.start)}"))
             a.end = b.start
 
     def bad(c: Cue) -> bool:
@@ -873,7 +931,7 @@ def fix_timing(cues: list[Cue], tp: TimingParams) -> list[tuple]:
                 t += (we - ws) * w / tot
                 c.end = int(round(t))
             after = f"{fmt_time(group[0].start)}–{fmt_time(group[-1].end)}"
-            log.append((i + 1, f"重新分配 {len(group)} 條", f"{before} → {after}"))
+            log.append((idx_str(group[0]), f"重新分配 {len(group)} 條", f"{before} → {after}"))
         i = j + 1
     return log
 
@@ -1083,6 +1141,8 @@ def main(argv=None):
     ap.add_argument("--report", help="把修改清單寫到此檔")
     ap.add_argument("--dry-run", action="store_true", help="只顯示修改，不寫檔")
     ap.add_argument("--encoding", help="輸入檔編碼（預設自動判斷 UTF-8/UTF-16/Big5）")
+    ap.add_argument("--out-encoding", default="auto",
+                    help="輸出編碼：auto（UTF-8，輸入有 BOM 就保留）、utf-8、utf-8-sig（含 BOM）、big5…")
     g = ap.add_argument_group("詞典")
     g.add_argument("--dict", action="append", default=[], help="自訂詞典（每行：詞 [詞頻]），可指定多個")
     g.add_argument("--main-dict", help="主詞典檔（如 jieba 的 dict.txt.big）；預設自動使用程式旁的 dict.txt.big，填 none 停用")
@@ -1108,12 +1168,22 @@ def main(argv=None):
     g.add_argument("--max-cps", type=float, default=TimingParams.max_cps, help="每秒超過幾個字視為過快")
     g.add_argument("--min-dur", type=float, default=TimingParams.min_dur, help="短於幾秒視為過短")
     g.add_argument("--target-cps", type=float, default=TimingParams.target_cps, help="修正時的目標語速（每秒字數）")
+    g.add_argument("--min-gap", type=int, default=TimingParams.min_gap, help="修正時字幕之間至少保留幾毫秒")
+    g.add_argument("--max-dur", type=float, default=TimingParams.max_dur, help="長於幾秒視為過長（只警告，0=不檢查）")
     g.add_argument("--timing-warnings", type=int, default=50, help="報告中最多列出幾筆時間軸警告")
     a = ap.parse_args(argv)
 
     p = Params(max_chars=a.max_chars, max_shift=a.max_shift, min_gain=a.min_gain,
                max_gap=a.max_gap, allow_merge=not a.no_merge, split_chars=a.split_chars)
-    tp = TimingParams(max_cps=a.max_cps, min_dur=a.min_dur, target_cps=a.target_cps)
+    tp = TimingParams(max_cps=a.max_cps, min_dur=a.min_dur, target_cps=a.target_cps,
+                      min_gap=a.min_gap, max_dur=a.max_dur)
+    import codecs
+    for enc_name in (a.encoding, None if a.out_encoding == "auto" else a.out_encoding):
+        if enc_name:
+            try:
+                codecs.lookup(enc_name)
+            except LookupError:
+                sys.exit(f"錯誤：不認得的編碼「{enc_name}」（例：utf-8、utf-8-sig、big5、cp950）")
 
     rules: list[Rule] = []
     for path in a.replace:
@@ -1225,8 +1295,14 @@ def main(argv=None):
             f.write(report + "\n")
     if not a.dry_run:
         out = out_path
-        with open(out, "w", encoding="utf-8-sig" if had_bom else "utf-8") as f:
-            f.write(write_srt(cues, a.max_line, seg))
+        out_enc = ("utf-8-sig" if had_bom else "utf-8") if a.out_encoding == "auto" else a.out_encoding
+        data = write_srt(cues, a.max_line, seg)
+        try:
+            data.encode(out_enc)
+        except UnicodeEncodeError as e:
+            sys.exit(f"錯誤：字幕中的「{data[e.start:e.end]}」無法用 {out_enc} 編碼儲存，請改用 utf-8")
+        with open(out, "w", encoding=out_enc) as f:
+            f.write(data)
         print(f"已輸出：{out}")
 
 

@@ -130,6 +130,14 @@ class App(tk.Tk):
         ttk.Label(f, text="輸出 SRT").grid(row=1, column=0, sticky="w", pady=(4, 0))
         ttk.Entry(f, textvariable=self.v_out).grid(row=1, column=1, sticky="ew", padx=6, pady=(4, 0))
         ttk.Button(f, text="另存為…", command=self.pick_output).grid(row=1, column=2, pady=(4, 0))
+        self.v_enc = tk.StringVar(value="auto")
+        e = ttk.Frame(f)
+        e.grid(row=2, column=1, sticky="w", padx=6, pady=(4, 0))
+        ttk.Label(e, text="輸出編碼").pack(side="left")
+        ttk.Combobox(e, textvariable=self.v_enc, width=10, state="readonly",
+                     values=["auto", "utf-8", "utf-8-sig", "big5"]).pack(side="left", padx=4)
+        ttk.Label(e, text="舊版 Windows 軟體顯示亂碼時，改選 utf-8-sig 或 big5",
+                  foreground="#777").pack(side="left")
 
         # --- 詞典與取代 ---
         f = ttk.LabelFrame(root, text="2. 詞典與取代表（可省略）", padding=8)
@@ -268,6 +276,7 @@ class App(tk.Tk):
         args += ["--max-chars", str(self._num(self.v_maxchars, "每條理想長度")),
                  "--max-line", str(self._num(self.v_wrap, "折行長度")),
                  "--min-gain", str(self._num(self.v_gain, "修改門檻"))]
+        args += ["--out-encoding", self.v_enc.get() or "auto"]
         if dry:
             args.append("--dry-run")
         else:
@@ -421,7 +430,7 @@ class App(tk.Tk):
             "reseg": self.v_reseg.get(), "merge": self.v_merge.get(),
             "split": self.v_split.get(), "split_n": self.v_split_n.get(),
             "timing": self.v_timing.get(), "maxchars": self.v_maxchars.get(),
-            "wrap": self.v_wrap.get(), "gain": self.v_gain.get(),
+            "wrap": self.v_wrap.get(), "gain": self.v_gain.get(), "enc": self.v_enc.get(),
             "last_dir": os.path.dirname(self.v_in.get()),
         }
 
@@ -445,7 +454,7 @@ class App(tk.Tk):
             if key in s:
                 var.set(bool(s[key]))
         for var, key in ((self.v_split_n, "split_n"), (self.v_maxchars, "maxchars"),
-                         (self.v_wrap, "wrap"), (self.v_gain, "gain")):
+                         (self.v_wrap, "wrap"), (self.v_gain, "gain"), (self.v_enc, "enc")):
             if key in s:
                 var.set(str(s[key]))
 

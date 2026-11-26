@@ -214,3 +214,62 @@ def test_bom_preserved(tmp_path):
     out = tmp_path / "b.srt"
     S.main([str(f), "-o", str(out)])
     assert out.read_bytes().startswith(b"\xef\xbb\xbf")
+
+
+# ---- 回歸測試：第二次檢查 ----
+def _rules(tmp_path, text):
+    f = tmp_path / "r.txt"
+    f.write_text(text, encoding="utf-8")
+    return S.load_replacements(str(f))
+
+
+def test_replacement_not_applied_twice(tmp_path):
+    cues = S.parse_srt(srt((1, 3, "我在臺大工作"), (3, 5, "第一行臺大\n第二行")))
+    S.apply_replacements(cues, _rules(tmp_path, "臺大 => 臺大醫院\n"))
+    assert texts(cues) == ["我在臺大醫院工作", "第一行臺大醫院第二行"]
+    assert "第一行臺大醫院\n第二行" in S.write_srt(cues, 0, SEG)
+
+
+def test_replacements_do_not_chain(tmp_path):
+    cues = S.parse_srt(srt((1, 3, "宜孕醫療和移運")))
+    S.apply_replacements(cues, _rules(tmp_path, "宜孕 => 移運\n移運 => 宜蘊\n"))
+    assert texts(cues) == ["移運醫療和宜蘊"]
+
+
+def test_longest_match_wins(tmp_path):
+    cues = S.parse_srt(srt((1, 3, "臺大醫院")))
+    S.apply_replacements(cues, _rules(tmp_path, "臺大 => X\n臺大醫院 => Y\n"))
+    assert texts(cues) == ["Y"]
+
+
+def test_timing_ignores_tags():
+    c = S.make_cue(0, 1000, ['前面<font color="#ffff00">重點</font>後面'])
+    assert S.timing_len(c.text) == 6
+
+
+def test_timing_report_uses_original_index():
+    cues, _, _ = run(srt((1, 3, "他說他已經吃飽"), (3, 5, "了所以不用等他"), (5, 5.1, "好")))
+    w = S.check_timing(cues, S.TimingParams())
+    assert w[0][0] == "3"
+
+
+def test_long_duration_warning():
+    w = S.check_timing(S.parse_srt(srt((1, 20, "好"))), S.TimingParams())
+    assert w and w[0][2] == "過長"
+
+
+def test_bad_encoding_message(tmp_path):
+    import pytest
+    f = tmp_path / "a.srt"
+    f.write_text(srt((1, 3, "測試")), encoding="utf-8")
+    with pytest.raises(SystemExit) as e:
+        S.main([str(f), "--encoding", "big-5x", "--dry-run"])
+    assert "編碼" in str(e.value.code)
+
+
+def test_out_encoding_big5(tmp_path):
+    f = tmp_path / "a.srt"
+    f.write_text(srt((1, 3, "我們明天要去台"), (3, 5, "北看展覽")), encoding="utf-8")
+    out = tmp_path / "b.srt"
+    S.main([str(f), "-o", str(out), "--out-encoding", "big5"])
+    assert "台北" in out.read_bytes().decode("big5")
